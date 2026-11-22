@@ -19,9 +19,9 @@ on:
         required: false
         default: "350"
       time_budget_min:
-        description: "单次扫描时间预算（分钟，默认 50，最大按 50 计）：到点后停止扫描、验完队列并保存断点"
+        description: "单次扫描时间预算（分钟，默认 330，上限为 job 超时减 10 分钟，即 350）：到点后停止扫描、验完队列并保存断点"
         required: false
-        default: "50"
+        default: "330"
       batch_size:
         description: "每批扫描的 IP 数（默认 2000）：每批扫完立即送 API 验证并落盘断点"
         required: false
@@ -58,7 +58,8 @@ concurrency:
 jobs:
   scan-and-verify:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    # 公开仓库的 GitHub 托管 runner：单个 job 最长 6 小时（360 分钟），且分钟数不限量
+    timeout-minutes: 360
 
     steps:
       - name: Checkout repository
@@ -73,11 +74,12 @@ jobs:
         env:
           CF_SOURCE: "来源-1.txt"
           CF_VERIFY_SCRIPT: "verify.py"
-          CF_JOB_LIMIT_MIN: "60"
+          CF_JOB_LIMIT_MIN: "360"      # 必须与上面的 timeout-minutes 保持一致
+          CF_COMMIT_EVERY_MIN: "20"    # 运行期间每 20 分钟增量提交一次断点和结果
           CF_PORTS: ${{ github.event.inputs.ports }}
           CF_MIN_LATENCY_MS: ${{ github.event.inputs.min_latency_ms }}
           CF_MAX_LATENCY_MS: ${{ github.event.inputs.max_latency_ms }}
-          CF_TIME_BUDGET_MIN: ${{ github.event.inputs.time_budget_min }}
+          CF_TIME_BUDGET_MIN: ${{ github.event.inputs.time_budget_min || '330' }}
           CF_BATCH_SIZE: ${{ github.event.inputs.batch_size }}
           CF_SCAN_CONCURRENCY: ${{ github.event.inputs.scan_concurrency }}
           CF_SCAN_TIMEOUT_MS: ${{ github.event.inputs.scan_timeout_ms }}
