@@ -1,4 +1,4 @@
-name: CF 反代 IP 优选（来源-1.txt · 断点续跑 · API 精筛）
+name: CF 反代 IP 优选（来源-1.txt · 断点续跑 · 直连精筛）
 
 on:
   schedule:
@@ -23,7 +23,7 @@ on:
         required: false
         default: "330"
       batch_size:
-        description: "每批扫描的 IP 数（默认 2000）：每批扫完立即送 API 验证并落盘断点"
+        description: "每批扫描的 IP 数（默认 2000）：每批扫完立即送验证并落盘断点"
         required: false
         default: "2000"
       scan_concurrency:
@@ -35,9 +35,9 @@ on:
         required: false
         default: "1000"
       verify_concurrent:
-        description: "verify.py API 验证并发（默认 32）"
+        description: "verify.py 直连验证并发（默认 64）"
         required: false
-        default: "32"
+        default: "64"
       reset_state:
         description: "清空断点和待验证队列，从来源-1.txt 开头重新扫描（true / false，默认 false）"
         required: false
@@ -74,6 +74,8 @@ jobs:
         env:
           CF_SOURCE: "来源-1.txt"
           CF_VERIFY_SCRIPT: "verify.py"
+          # 托管在 Cloudflare（橙云）上的你自己的域名；在仓库 Settings → Secrets/Variables 中新建 CF_VERIFY_SNI
+          CF_VERIFY_SNI: ${{ secrets.CF_VERIFY_SNI || vars.CF_VERIFY_SNI }}
           CF_JOB_LIMIT_MIN: "360"      # 必须与上面的 timeout-minutes 保持一致
           CF_COMMIT_EVERY_MIN: "20"    # 运行期间每 20 分钟增量提交一次断点和结果
           CF_PORTS: ${{ github.event.inputs.ports }}
