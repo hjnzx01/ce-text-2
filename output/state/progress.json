@@ -1,13 +1,13 @@
 {
   "round": 1,
-  "cursor": 10452000,
+  "cursor": 11000000,
   "stats": {
-    "open": 671113,
-    "in_range": 471685,
+    "open": 740892,
+    "in_range": 541436,
     "verified": 0
   },
   "fingerprint": "3950bb7e270bb9346d4bfbbb59884c54db5b26c5",
   "total": 566647297,
   "round_started": "2026-11-22 12:03:17",
-  "updated": "2026-11-22 16:23:50"
+  "updated": "2026-11-22 16:43:55"
 }
