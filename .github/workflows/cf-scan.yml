@@ -1,0 +1,113 @@
+name: CF 反代 IP 优选（来源-1.txt · 断点续跑 · API 精筛）
+
+on:
+  schedule:
+    # UTC 02:00（北京时间 10:00）。单次只能扫一部分网段，想更快扫完整份名单可改密，如 "0 */3 * * *"
+    - cron: "0 2 * * *"
+  workflow_dispatch:
+    inputs:
+      ports:
+        description: "扫描端口（逗号分隔，默认 443，如 443,8443）"
+        required: false
+        default: "443"
+      min_latency_ms:
+        description: "最小延迟（ms，默认 25）：TCP 平均延迟低于该值的丢弃；填 0 表示不设下限"
+        required: false
+        default: "25"
+      max_latency_ms:
+        description: "最大延迟（ms，默认 350）"
+        required: false
+        default: "350"
+      time_budget_min:
+        description: "单次扫描时间预算（分钟，默认 50，最大按 50 计）：到点后停止扫描、验完队列并保存断点"
+        required: false
+        default: "50"
+      batch_size:
+        description: "每批扫描的 IP 数（默认 2000）：每批扫完立即送 API 验证并落盘断点"
+        required: false
+        default: "2000"
+      scan_concurrency:
+        description: "TCP 扫描并发（默认 1500）"
+        required: false
+        default: "1500"
+      scan_timeout_ms:
+        description: "TCP 连接超时（ms，默认 1000）"
+        required: false
+        default: "1000"
+      verify_concurrent:
+        description: "verify.py API 验证并发（默认 32）"
+        required: false
+        default: "32"
+      reset_state:
+        description: "清空断点和待验证队列，从来源-1.txt 开头重新扫描（true / false，默认 false）"
+        required: false
+        default: "false"
+      clear_results:
+        description: "同时清空历史优选结果（true / false，默认 false）"
+        required: false
+        default: "false"
+
+permissions:
+  contents: write
+
+# 断点文件是串行续跑的，同一时间只允许一个实例；后到的排队等待，不取消正在跑的
+concurrency:
+  group: cf-ip-scan
+  cancel-in-progress: false
+
+jobs:
+  scan-and-verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+
+      - name: Configure git identity
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Scan (resume from checkpoint) & verify
+        env:
+          CF_SOURCE: "来源-1.txt"
+          CF_VERIFY_SCRIPT: "verify.py"
+          CF_JOB_LIMIT_MIN: "60"
+          CF_PORTS: ${{ github.event.inputs.ports }}
+          CF_MIN_LATENCY_MS: ${{ github.event.inputs.min_latency_ms }}
+          CF_MAX_LATENCY_MS: ${{ github.event.inputs.max_latency_ms }}
+          CF_TIME_BUDGET_MIN: ${{ github.event.inputs.time_budget_min }}
+          CF_BATCH_SIZE: ${{ github.event.inputs.batch_size }}
+          CF_SCAN_CONCURRENCY: ${{ github.event.inputs.scan_concurrency }}
+          CF_SCAN_TIMEOUT_MS: ${{ github.event.inputs.scan_timeout_ms }}
+          CF_VERIFY_CONCURRENT: ${{ github.event.inputs.verify_concurrent }}
+          CF_RESET_STATE: ${{ github.event.inputs.reset_state }}
+          CF_CLEAR_RESULTS: ${{ github.event.inputs.clear_results }}
+        run: python3 cf_scan.py
+
+      # 无论上一步成功、失败还是被取消，都把最新断点和结果提交回仓库
+      - name: Commit final checkpoint & results
+        if: always()
+        run: |
+          mkdir -p output/state
+          git add output
+          if ! git diff --staged --quiet; then
+            git commit -m "chore: final checkpoint $(date -u +'%Y-%m-%d %H:%M UTC')"
+            for i in 1 2 3; do
+              git push && break
+              git pull --rebase --autostash || true
+            done
+          else
+            echo "没有需要提交的变更。"
+          fi
+
+      - name: Show results
+        if: always()
+        run: |
+          echo "=== 断点 ==="
+          cat output/state/progress.json 2>/dev/null || echo "（无）"
+          echo
+          echo "=== 延迟最低的 20 个优选 IP:端口 ==="
+          head -n 20 output/best_ip_ports.txt 2>/dev/null || true
+          echo "累计优选 IP:端口 数: $(wc -l < output/best_ip_ports.txt 2>/dev/null || echo 0)"
