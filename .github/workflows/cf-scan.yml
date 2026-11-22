@@ -3,7 +3,7 @@ name: CF 反代 IP 优选（来源-1.txt · 断点续跑 · 直连精筛）
 on:
   schedule:
     # UTC 02:00（北京时间 10:00）。单次只能扫一部分网段，想更快扫完整份名单可改密，如 "0 */3 * * *"
-    - cron: "0 2 * * *"
+    - cron: "*/90 * * * *"
   workflow_dispatch:
     inputs:
       ports:
@@ -21,7 +21,7 @@ on:
       time_budget_min:
         description: "单次扫描时间预算（分钟，默认 330，上限为 job 超时减 10 分钟，即 350）：到点后停止扫描、验完队列并保存断点"
         required: false
-        default: "330"
+        default: "50"
       batch_size:
         description: "每批扫描的 IP 数（默认 2000）：每批扫完立即送验证并落盘断点"
         required: false
@@ -59,7 +59,7 @@ jobs:
   scan-and-verify:
     runs-on: ubuntu-latest
     # 公开仓库的 GitHub 托管 runner：单个 job 最长 6 小时（360 分钟），且分钟数不限量
-    timeout-minutes: 360
+    timeout-minutes: 60
 
     steps:
       - name: Checkout repository
@@ -76,7 +76,7 @@ jobs:
           CF_VERIFY_SCRIPT: "verify.py"
           # 托管在 Cloudflare（橙云）上的你自己的域名；在仓库 Settings → Secrets/Variables 中新建 CF_VERIFY_SNI
           CF_VERIFY_SNI: ${{ secrets.CF_VERIFY_SNI || vars.CF_VERIFY_SNI }}
-          CF_JOB_LIMIT_MIN: "360"      # 必须与上面的 timeout-minutes 保持一致
+          CF_JOB_LIMIT_MIN: "60"      # 必须与上面的 timeout-minutes 保持一致
           CF_COMMIT_EVERY_MIN: "20"    # 运行期间每 20 分钟增量提交一次断点和结果
           CF_PORTS: ${{ github.event.inputs.ports }}
           CF_MIN_LATENCY_MS: ${{ github.event.inputs.min_latency_ms }}
