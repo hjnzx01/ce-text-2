@@ -5,7 +5,7 @@ Cloudflare 反代 IP 优选（GitHub Actions 友好版）
 
 流程
   来源-1.txt 网段 → 全部拆成单 IP → 按批做 TCP 端口扫描（开放 + 延迟）
-  → 开放且延迟在范围内的 IP:端口 立即送 verify.py（API 精筛 + 反蜜罐）
+  → 开放且延迟在范围内的 IP:端口 立即送 verify.py（直连精筛：自有域名 SNI + /cdn-cgi/trace，含反蜜罐）
   → 通过者连同延迟写入 output/
 
 断点续跑
@@ -36,8 +36,6 @@ import subprocess
 import sys
 import tempfile
 import time
-import urllib.error
-import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -45,12 +43,6 @@ RESULT_COLUMNS = [
     "IP", "Port", "IP_Port", "TCP_Latency_ms", "API_Latency_ms",
     "Colo", "Country", "Region", "ASN", "Protocol", "Verified_At",
 ]
-
-API_HEADERS = {
-    "User-Agent": "Mozilla/5.0",
-    "Accept": "application/json",
-    "Origin": "https://090227.xyz",
-}
 
 STOP = False
 
@@ -258,15 +250,16 @@ def prepare_verify_script(script: Path) -> Path:
     return shim / script.name
 
 
-def api_reachable(api: str) -> bool:
-    req = urllib.request.Request(f"{api}?proxyip=1.1.1.1:443", headers=API_HEADERS)
+def verify_selftest(script: Path, timeout: float = 60.0) -> tuple[bool, str]:
+    """调用 verify.py --self-test：探测自有域名当前解析到的 CF 边缘 IP。
+    通过说明 域名已开橙云 / trace 可访问 / 证书与校验链路正常；返回 (是否通过, 最后一行输出)"""
     try:
-        with urllib.request.urlopen(req, timeout=10):
-            return True
-    except urllib.error.HTTPError as e:
-        return e.code < 500 and e.code != 429
-    except Exception:
-        return False
+        p = subprocess.run([sys.executable, str(script), "--self-test"],
+                           capture_output=True, text=True, timeout=timeout, cwd=script.parent)
+    except subprocess.TimeoutExpired:
+        return False, "自检超时"
+    lines = (p.stdout + "\n" + p.stderr).strip().splitlines()
+    return p.returncode == 0, (lines[-1] if lines else "无输出")
 
 
 def parse_verify_output(path: Path, lat_map: dict) -> list[dict]:
@@ -401,7 +394,6 @@ class Runner:
             cmd = [
                 sys.executable, str(self.verify_script),
                 "--input", str(inp), "--output", str(out),
-                "--api", self.a.api,
                 "--concurrent", str(self.a.verify_concurrent),
                 "--chunk", str(max(len(items), 1)),
             ]
@@ -411,6 +403,8 @@ class Runner:
                 if proc.returncode != 0:
                     ok = False
                     log(f"::warning::verify.py 退出码 {proc.returncode}：{(proc.stderr or proc.stdout).strip()[-300:]}")
+                elif proc.stderr.strip():
+                    log("    " + proc.stderr.strip().splitlines()[-1])
             except subprocess.TimeoutExpired:
                 ok = False
                 log(f"::warning::verify.py 运行超过 {int(timeout)}s 被终止，本组保留在待验证队列")
@@ -444,11 +438,11 @@ class Runner:
                 self.save_progress()
                 log(f"  [验证] {len(items)} 个 IP:端口 → 通过 {len(rows)} | 用时 {time.monotonic() - t:.0f}s | "
                     f"队列剩余 {len(self.pending)} | 累计优选 {len(self.results)}")
-                if not rows and len(items) >= 30 and not api_reachable(a.api):
-                    # 整组 0 通过且 API 连不上：别把这组当成"不合格"丢掉
+                if not rows and len(items) >= 30 and not verify_selftest(self.verify_script)[0]:
+                    # 整组 0 通过且自检失败：别把这组当成"不合格"丢掉
                     self.pending.update({k: v for k, v in items})
                     self.save_pending()
-                    raise Abort("API 无法访问（整组验证 0 通过且探测失败），已保留待验证队列，请稍后重试")
+                    raise Abort("验证链路自检失败（整组 0 通过），已保留待验证队列；请检查 CF_VERIFY_SNI 域名是否仍是橙云且 /cdn-cgi/trace 可访问")
             else:
                 self.fail_streak += 1
                 self.save_progress()
@@ -525,9 +519,13 @@ class Runner:
                 pass
         conc = max(50, min(a.concurrency, soft - 200))
 
+        if not env_str("CF_VERIFY_SNI"):
+            raise Abort("未设置 CF_VERIFY_SNI（托管在 Cloudflare 上的自有域名），无法进行直连验证")
         self.verify_script = prepare_verify_script(Path(a.verify_script))
-        if not api_reachable(a.api):
-            raise Abort(f"验证 API 无法访问：{a.api}")
+        ok, info = verify_selftest(self.verify_script)
+        if not ok:
+            raise Abort(f"verify.py {info}")
+        log(f"verify.py {info}")
 
         log(f"网段 {len(nets)} 个（去重合并后），共 {self.total:,} 个 IP；无效 {bad}、跳过超大 IPv6 {skipped_v6}")
         log(f"第 {prog['round']} 轮 | 断点 cursor={prog['cursor']:,} | 端口 {a.ports} | "
@@ -584,7 +582,7 @@ class Runner:
         lines = [
             "### CF IP 优选运行摘要", "",
             f"- 第 {self.prog.get('round', 1)} 轮进度：**{cur:,} / {self.total:,}**（{cur / tot * 100:.2f}%）",
-            f"- 本次扫描 {self.run_scanned:,} 个 IP，开放 {self.run_open:,}，延迟达标 {self.run_inrange:,}，API 验证通过 {self.run_verified:,}",
+            f"- 本次扫描 {self.run_scanned:,} 个 IP，开放 {self.run_open:,}，延迟达标 {self.run_inrange:,}，验证通过 {self.run_verified:,}",
             f"- 待验证队列 {len(self.pending)} 条；累计优选 {len(self.results)} 条", "",
         ]
         if top:
@@ -607,8 +605,7 @@ def parse_args():
     p.add_argument("--timeout-ms", default=env_str("CF_SCAN_TIMEOUT_MS", "1000"))
     p.add_argument("--samples", default=env_str("CF_SAMPLES", "3"))
     p.add_argument("--verify-script", default=env_str("CF_VERIFY_SCRIPT", "verify.py"))
-    p.add_argument("--api", default=env_str("CF_API", "https://api.090227.xyz/check"))
-    p.add_argument("--verify-concurrent", default=env_str("CF_VERIFY_CONCURRENT", "32"))
+    p.add_argument("--verify-concurrent", default=env_str("CF_VERIFY_CONCURRENT", "64"))
     p.add_argument("--verify-chunk", default=env_str("CF_VERIFY_CHUNK", "300"))
     p.add_argument("--verify-timeout", default=env_str("CF_VERIFY_TIMEOUT", "900"))
     p.add_argument("--min-v6-prefix", default=env_str("CF_MIN_V6_PREFIX", "112"))
@@ -619,7 +616,7 @@ def parse_args():
     r = p.parse_args()
 
     a = argparse.Namespace()
-    a.source, a.api, a.verify_script, a.out_dir = r.source, r.api, r.verify_script, r.out_dir
+    a.source, a.verify_script, a.out_dir = r.source, r.verify_script, r.out_dir
     a.ports = parse_ports(r.ports)
     a.min_latency = to_num(r.min_latency, 25.0, float, lo=0)
     a.max_latency = to_num(r.max_latency, 350.0, float, lo=1)
@@ -632,7 +629,7 @@ def parse_args():
     a.concurrency = to_num(r.concurrency, 1500, int, lo=1)
     a.timeout_ms = to_num(r.timeout_ms, 1000, int, lo=50)
     a.samples = to_num(r.samples, 3, int, lo=1, hi=10)
-    a.verify_concurrent = to_num(r.verify_concurrent, 32, int, lo=1)
+    a.verify_concurrent = to_num(r.verify_concurrent, 64, int, lo=1)
     a.verify_chunk = to_num(r.verify_chunk, 300, int, lo=1)
     a.verify_timeout = to_num(r.verify_timeout, 900, int, lo=30)
     a.min_v6_prefix = to_num(r.min_v6_prefix, 112, int, lo=1, hi=128)
