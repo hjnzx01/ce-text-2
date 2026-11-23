@@ -1,6 +1,6 @@
 {
   "round": 1,
-  "cursor": 15664000,
+  "cursor": 16838000,
   "stats": {
     "open": 1810872,
     "in_range": 1349817,
@@ -9,5 +9,5 @@
   "fingerprint": "3950bb7e270bb9346d4bfbbb59884c54db5b26c5",
   "total": 566647297,
   "round_started": "2026-11-22 12:03:17",
-  "updated": "2026-11-23 01:18:40"
+  "updated": "2026-11-23 01:38:43"
 }
