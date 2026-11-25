@@ -1,18 +1,27 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Cloudflare 反代 IP 优选（GitHub Actions 友好版）
+Cloudflare 反代 IP 优选（GitHub Actions 友好版 · 按端口接力）
 
 流程
   来源-1.txt 网段 → 全部拆成单 IP → 按批做 TCP 端口扫描（开放 + 延迟）
   → 开放且延迟在范围内的 IP:端口 立即送 verify.py（直连精筛：自有域名 SNI + /cdn-cgi/trace，含反蜜罐）
   → 通过者连同延迟写入 output/
 
+端口队列（每次运行只扫一个端口）
+  端口列表默认 DEFAULT_PORTS（443 在最前）。每次运行只扫「队列中第一个尚未完成的端口」：
+  该端口的全部 IP 扫完 → 验完队列 → 标记为已完成 → 本次运行结束；
+  下一次运行（workflow 在 10 分钟后自动触发）自动换成队列里的下一个端口。
+  一次运行时间预算用完但端口没扫完，则下次继续扫同一个端口（断点续跑）。
+  所有端口都扫完后：默认停止自动接力（CF_LOOP_FOREVER=true 则自动开始新一轮）。
+
 断点续跑
-  output/state/progress.json       已扫描到的 IP 偏移（cursor）、轮次、来源指纹
+  output/state/progress.json       当前端口、该端口的 IP 偏移（cursor）、已完成端口、轮次、来源指纹
   output/state/pending_verify.txt  已扫到但尚未验证完的 IP:端口（下次运行优先验证）
-  每扫完一批就落盘；到达时间预算后停止，下次运行从 cursor 继续。
-  一轮扫完后，下一次运行自动开始新一轮（历史结果保留，同 IP:端口以最新为准）。
+
+去重
+  结果以 (IP, 端口) 为唯一键；同 IP:端口 重复验证通过时以最新一次为准，
+  cf_verified.csv / best_ip_ports.txt 中不会出现重复的 IP:端口。
 
 只依赖标准库；verify.py 需与本脚本同目录（可用 --verify-script 指定）。
 """
@@ -36,8 +45,18 @@ import subprocess
 import sys
 import tempfile
 import time
+import traceback
 from datetime import datetime, timezone
 from pathlib import Path
+
+# 默认端口队列：按顺序逐个扫描，443 最先
+DEFAULT_PORTS = [
+    443, 80, 8443, 9443, 30005, 8880, 2083, 2053, 8080, 2096,
+    24442, 2082, 1024, 2087, 2086, 2095, 1025, 10443, 2052, 4443,
+    4433, 7443, 10000, 8085, 27017, 10002, 20000, 10001, 28017, 18080,
+    11434, 20202, 20201, 8000, 10101, 50001, 44365, 8081, 444, 4444,
+    8001, 49154, 6443, 14430, 65530, 10033, 3389, 11235, 20002, 18852,
+]
 
 RESULT_COLUMNS = [
     "IP", "Port", "IP_Port", "TCP_Latency_ms", "API_Latency_ms",
@@ -66,7 +85,13 @@ TOKEN_V6_BRACKET = re.compile(r"^\[([0-9A-Fa-f:.]+(?:/\d+)?)\](?::\d+)?$")
 
 
 class Abort(Exception):
-    """不可继续的错误：保存状态后以非零码退出"""
+    """不可继续的错误：保存状态后以非零码退出。
+    fatal=True（配置类错误）：同时通知 workflow 不要再自动接力；
+    fatal=False（运行期的临时故障）：保留状态，workflow 仍会 10 分钟后重试。"""
+
+    def __init__(self, msg: str, fatal: bool = True):
+        super().__init__(msg)
+        self.fatal = fatal
 
 
 # ───────────────────────── 通用小工具 ─────────────────────────
@@ -107,7 +132,22 @@ def parse_ports(raw: str) -> list[int]:
                 ports.append(int(tok))
         else:
             log(f"::warning::忽略无效端口 {tok}")
-    return ports or [443]
+    return ports or list(DEFAULT_PORTS)
+
+
+def norm_key(ip, port) -> tuple[str, str]:
+    """(IP, 端口) 的规范化唯一键：IPv6 写法统一、端口去前导零，保证 IP:端口 不会因写法不同而重复"""
+    ip = str(ip).strip().strip("[]")
+    try:
+        ip = str(ipaddress.ip_address(ip))
+    except ValueError:
+        pass
+    port = str(port).strip()
+    try:
+        port = str(int(port))
+    except ValueError:
+        pass
+    return ip, port
 
 
 def atomic_write(path: Path, text: str) -> None:
@@ -266,6 +306,7 @@ def parse_verify_output(path: Path, lat_map: dict) -> list[dict]:
     """verify.py 输出：ip,port,TRUE,colo,country,region,api_latency,,ASxxx,proto"""
     rows = []
     stamp = now_iso()
+    seen: set[tuple[str, str]] = set()
     for line in path.read_text(encoding="utf-8", errors="ignore").splitlines():
         p = line.strip().split(",")
         if len(p) < 10:
@@ -274,10 +315,14 @@ def parse_verify_output(path: Path, lat_map: dict) -> list[dict]:
             ipaddress.ip_address(p[0])
         except ValueError:
             continue  # 表头等非数据行
-        ip, port = p[0], p[1]
-        tcp = lat_map.get((ip, port))
+        key = norm_key(p[0], p[1])
+        if key in seen:
+            continue  # 同一批里重复的 IP:端口 只取一条
+        tcp = lat_map.get(key)
         if tcp is None:
             continue
+        seen.add(key)
+        ip, port = key
         rows.append({
             "IP": ip, "Port": port, "IP_Port": f"{ip}:{port}",
             "TCP_Latency_ms": tcp, "API_Latency_ms": p[-4],
@@ -336,6 +381,11 @@ class Runner:
         # 本次运行统计
         self.run_scanned = self.run_open = self.run_inrange = self.run_verified = 0
         self.total = 0
+        # 端口接力
+        self.port: int | None = None        # 本次运行扫描的端口
+        self.port_finished = False           # 本次运行是否把该端口扫完了
+        self.all_done = False                # 端口队列是否全部扫完
+        self.stop_chain = False              # 通知 workflow：不要再自动接力
 
     # ---- 状态读写 ----
     def load_results(self) -> None:
@@ -345,9 +395,16 @@ class Runner:
             for row in csv.DictReader(f):
                 try:
                     float(row["TCP_Latency_ms"])
-                    self.results[(row["IP"], row["Port"])] = row
+                    key = norm_key(row["IP"], row["Port"])
                 except (KeyError, TypeError, ValueError):
                     continue
+                old = self.results.get(key)
+                # 历史文件里若已有重复的 IP:端口，保留验证时间最新的一条
+                if old is not None and (old.get("Verified_At") or "") > (row.get("Verified_At") or ""):
+                    continue
+                row["IP"], row["Port"] = key
+                row["IP_Port"] = f"{key[0]}:{key[1]}"
+                self.results[key] = row
 
     def load_pending(self) -> None:
         if not self.pending_path.exists():
@@ -356,7 +413,7 @@ class Runner:
             parts = line.split()
             if len(parts) >= 2 and ":" in parts[0]:
                 ip, port = parts[0].rsplit(":", 1)
-                self.pending[(ip, port)] = parts[1]
+                self.pending[norm_key(ip, port)] = parts[1]
 
     def save_pending(self) -> None:
         text = "".join(f"{ip}:{port}\t{lat}\n" for (ip, port), lat in self.pending.items())
@@ -367,7 +424,18 @@ class Runner:
         atomic_write(self.progress_path, json.dumps(self.prog, ensure_ascii=False, indent=2) + "\n")
 
     def write_outputs(self) -> None:
-        rows = sorted(self.results.values(), key=lambda r: (float(r["TCP_Latency_ms"]), r["IP"]))
+        rows = sorted(self.results.values(), key=lambda r: (float(r["TCP_Latency_ms"]), r["IP"], str(r["Port"])))
+        # 最后一道保险：按 (IP, 端口) 去重，保证输出里没有重复的 IP:端口
+        seen: set[tuple[str, str]] = set()
+        uniq = []
+        for r in rows:
+            k = norm_key(r["IP"], r["Port"])
+            if k in seen:
+                continue
+            seen.add(k)
+            uniq.append(r)
+        rows = uniq
+
         buf = io.StringIO()
         w = csv.DictWriter(buf, fieldnames=RESULT_COLUMNS, extrasaction="ignore", lineterminator="\n")
         w.writeheader()
@@ -424,7 +492,7 @@ class Runner:
             t = time.monotonic()
             rows, ok = self.run_verify(items, min(a.verify_timeout, remaining - 15))
             for r in rows:
-                self.results[(r["IP"], r["Port"])] = r
+                self.results[norm_key(r["IP"], r["Port"])] = r  # 同 IP:端口 以最新为准，天然去重
             if rows:
                 self.write_outputs()
             if ok:
@@ -442,13 +510,39 @@ class Runner:
                     # 整组 0 通过且自检失败：别把这组当成"不合格"丢掉
                     self.pending.update({k: v for k, v in items})
                     self.save_pending()
-                    raise Abort("验证链路自检失败（整组 0 通过），已保留待验证队列；请检查 CF_VERIFY_SNI 域名是否仍是橙云且 /cdn-cgi/trace 可访问")
+                    raise Abort("验证链路自检失败（整组 0 通过），已保留待验证队列；请检查 CF_VERIFY_SNI 域名是否仍是橙云且 /cdn-cgi/trace 可访问",
+                                fatal=False)
             else:
                 self.fail_streak += 1
                 self.save_progress()
                 if self.fail_streak >= 3:
-                    raise Abort("verify.py 连续 3 次失败，已保存进度并停止")
+                    raise Abort("verify.py 连续 3 次失败，已保存进度并停止", fatal=False)
                 return
+
+    # ---- 端口队列 ----
+    def pick_port(self) -> tuple[int, list[int]]:
+        """决定本次运行扫哪个端口：队列中第一个尚未完成的端口；必要时开始新一轮"""
+        prog, ports = self.prog, self.a.ports
+        prog["done_ports"] = [p for p in prog.get("done_ports", []) if p in ports]
+        todo = [p for p in ports if p not in prog["done_ports"]]
+
+        # 上次该端口已扫完但没来得及标记（例如收尾验证中途出错）：补记并换下一个
+        if todo and prog.get("port") == todo[0] and prog.get("cursor", 0) >= self.total:
+            prog["done_ports"].append(todo[0])
+            todo = todo[1:]
+
+        if not todo:
+            prog.update(round=prog.get("round", 1) + 1, cursor=0, stats={}, done_ports=[],
+                        port=None, round_started=now_iso())
+            log(f"端口队列已全部扫完，开始第 {prog['round']} 轮")
+            todo = list(ports)
+
+        cur = todo[0]
+        if "port" not in prog:        # 兼容旧版断点（没有端口字段）：沿用其 cursor，视为当前端口
+            prog["port"] = cur
+        if prog["port"] != cur:       # 换端口：该端口从第一个 IP 重新开始
+            prog.update(port=cur, cursor=0, stats={})
+        return cur, todo
 
     # ---- 日志 ----
     def maybe_log(self, force: bool = False) -> None:
@@ -457,7 +551,7 @@ class Runner:
             return
         self.last_log = now
         cur = self.prog["cursor"]
-        log(f"[进度] {cur:,}/{self.total:,} ({cur / self.total * 100:.2f}%) 第{self.prog['round']}轮 | "
+        log(f"[进度] 端口 {self.port} {cur:,}/{self.total:,} ({cur / self.total * 100:.2f}%) 第{self.prog['round']}轮 | "
             f"本次已扫 {self.run_scanned:,} 开放 {self.run_open:,} 延迟达标 {self.run_inrange:,} "
             f"验证通过 {self.run_verified:,} | 队列 {len(self.pending)} | 用时 {(now - self.t0) / 60:.1f}min")
 
@@ -497,13 +591,13 @@ class Runner:
             log(f"::warning::{a.source} 的网段内容与上次不同，旧断点作废，从头开始新一轮（历史结果保留）")
             prog = {"round": prog.get("round", 1) + 1}
         if "cursor" not in prog or prog.get("fingerprint") != fp:
-            prog = {"round": prog.get("round", 1), "cursor": 0, "stats": {}}
+            prog = {"round": prog.get("round", 1), "cursor": 0, "done_ports": [], "stats": {}}
         prog.update(fingerprint=fp, total=self.total)
-        if prog["cursor"] >= self.total:
-            prog.update(round=prog["round"] + 1, cursor=0, stats={}, round_started=now_iso())
-            log(f"上一轮已全部扫完，开始第 {prog['round']} 轮")
         prog.setdefault("round_started", now_iso())
         self.prog = prog
+
+        port, _todo = self.pick_port()
+        self.port = port
 
         self.load_results()
         self.load_pending()
@@ -528,7 +622,8 @@ class Runner:
         log(f"verify.py {info}")
 
         log(f"网段 {len(nets)} 个（去重合并后），共 {self.total:,} 个 IP；无效 {bad}、跳过超大 IPv6 {skipped_v6}")
-        log(f"第 {prog['round']} 轮 | 断点 cursor={prog['cursor']:,} | 端口 {a.ports} | "
+        log(f"第 {prog['round']} 轮 | 当前端口 {port}（队列第 {a.ports.index(port) + 1}/{len(a.ports)} 个，"
+            f"本轮已完成 {len(prog['done_ports'])} 个）| 断点 cursor={prog['cursor']:,} | "
             f"延迟 {a.min_latency}~{a.max_latency}ms | 批 {a.batch_size} | 并发 {conc} | 超时 {a.timeout_ms}ms")
         log(f"已有优选 {len(self.results)} 条 | 待验证队列 {len(self.pending)} 条 | "
             f"扫描预算 {(self.soft_deadline - self.t0) / 60:.1f}min")
@@ -545,9 +640,9 @@ class Runner:
                 if not batch:
                     break
                 n_open, good = loop.run_until_complete(scan_batch(
-                    batch, a.ports, timeout, conc, a.samples, 100, a.min_latency, a.max_latency))
-                for ip, port, lat in good:
-                    self.pending[(ip, str(port))] = f"{lat}"
+                    batch, [port], timeout, conc, a.samples, 100, a.min_latency, a.max_latency))
+                for ip, p, lat in good:
+                    self.pending[norm_key(ip, p)] = f"{lat}"
                 prog["cursor"] += len(batch)
                 st = prog.setdefault("stats", {})
                 st["open"] = st.get("open", 0) + n_open
@@ -560,30 +655,49 @@ class Runner:
                 if good:
                     self.drain_pending()  # 扫到即验
                 self.maybe_log()
-                self.maybe_commit(f"cursor {prog['cursor']}/{self.total}")
+                self.maybe_commit(f"port {port} cursor {prog['cursor']}/{self.total}")
             self.drain_pending()  # 收尾：把队列里剩下的在宽限期内验完
+
+            # 该端口的全部 IP 都扫完了：标记完成，本次运行到此结束；下次运行自动换下一个端口
+            if prog["cursor"] >= self.total and not STOP:
+                self.port_finished = True
+                if port not in prog["done_ports"]:
+                    prog["done_ports"].append(port)
+                self.all_done = all(p in prog["done_ports"] for p in a.ports)
+                self.stop_chain = self.all_done and not a.loop_forever
         finally:
             loop.close()
             self.save_pending()
             self.save_progress()
             self.write_outputs()
 
-        done = prog["cursor"] >= self.total
         self.maybe_log(force=True)
-        log("本轮全部扫完，下次运行将自动开始新一轮" if done else "已到时间预算，下次运行将从断点继续")
+        if self.port_finished:
+            nxt = next((p for p in a.ports if p not in prog["done_ports"]), None)
+            if self.all_done:
+                log(f"端口 {port} 已扫描完成，端口队列全部扫完" +
+                    ("，不再自动接力" if self.stop_chain else "，下次运行开始新一轮"))
+            else:
+                log(f"端口 {port} 已扫描完成，下次运行将扫描端口 {nxt}")
+        else:
+            log(f"已到时间预算，端口 {port} 尚未扫完，下次运行将从断点继续")
 
-    # ---- 摘要 ----
+    # ---- 摘要 / 输出 ----
     def write_summary(self) -> None:
         path = os.environ.get("GITHUB_STEP_SUMMARY")
         if not path or not self.prog:
             return
         cur, tot = self.prog.get("cursor", 0), max(self.total, 1)
+        done_ports = self.prog.get("done_ports", [])
         top = sorted(self.results.values(), key=lambda r: float(r["TCP_Latency_ms"]))[:10]
         lines = [
             "### CF IP 优选运行摘要", "",
-            f"- 第 {self.prog.get('round', 1)} 轮进度：**{cur:,} / {self.total:,}**（{cur / tot * 100:.2f}%）",
+            f"- 第 {self.prog.get('round', 1)} 轮 · 端口 **{self.port}**"
+            f"（{'已扫完' if self.port_finished else '未扫完，下次继续'}）：**{cur:,} / {self.total:,}**（{cur / tot * 100:.2f}%）",
+            f"- 本轮已完成端口 {len(done_ports)}/{len(self.a.ports)}：{','.join(map(str, done_ports)) or '（无）'}",
             f"- 本次扫描 {self.run_scanned:,} 个 IP，开放 {self.run_open:,}，延迟达标 {self.run_inrange:,}，验证通过 {self.run_verified:,}",
-            f"- 待验证队列 {len(self.pending)} 条；累计优选 {len(self.results)} 条", "",
+            f"- 待验证队列 {len(self.pending)} 条；累计优选 {len(self.results)} 条（IP:端口 唯一）",
+            f"- 自动接力：{'已停止' if self.stop_chain else f'{self.a.wait_note}后触发下一次运行'}", "",
         ]
         if top:
             lines += ["| IP:端口 | TCP 延迟 | 机房 | 国家 |", "|---|---|---|---|"]
@@ -591,11 +705,21 @@ class Runner:
         with open(path, "a", encoding="utf-8") as f:
             f.write("\n".join(lines) + "\n")
 
+    def export_outputs(self) -> None:
+        """把 stop / port 写入 $GITHUB_OUTPUT，供 workflow 判断是否继续自动接力"""
+        path = os.environ.get("GITHUB_OUTPUT")
+        if not path:
+            return
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(f"stop={'true' if self.stop_chain else 'false'}\n")
+            f.write(f"port={self.port or ''}\n")
+
 
 def parse_args():
-    p = argparse.ArgumentParser(description="Cloudflare 反代 IP 优选：分批扫描 + 断点续跑 + API 精筛")
+    p = argparse.ArgumentParser(description="Cloudflare 反代 IP 优选：按端口队列接力 + 断点续跑 + 直连精筛")
     p.add_argument("--source", default=env_str("CF_SOURCE", "来源-1.txt"))
-    p.add_argument("--ports", default=env_str("CF_PORTS", "443"))
+    p.add_argument("--ports", default=env_str("CF_PORTS", ",".join(map(str, DEFAULT_PORTS))),
+                   help="端口队列（逗号分隔），每次运行只扫第一个未完成的端口")
     p.add_argument("--min-latency", default=env_str("CF_MIN_LATENCY_MS", "25"))
     p.add_argument("--max-latency", default=env_str("CF_MAX_LATENCY_MS", "350"))
     p.add_argument("--budget-min", default=env_str("CF_TIME_BUDGET_MIN", "50"))
@@ -611,6 +735,9 @@ def parse_args():
     p.add_argument("--min-v6-prefix", default=env_str("CF_MIN_V6_PREFIX", "112"))
     p.add_argument("--commit-every-min", default=env_str("CF_COMMIT_EVERY_MIN", "10"))
     p.add_argument("--out-dir", default=env_str("CF_OUT_DIR", "output"))
+    p.add_argument("--wait-min", default=env_str("CF_NEXT_RUN_WAIT_MIN", "10"))
+    p.add_argument("--loop-forever", action="store_true", default=env_str("CF_LOOP_FOREVER", "false").lower() == "true",
+                   help="所有端口扫完后自动开始新一轮（默认扫完即停止自动接力）")
     p.add_argument("--reset-state", action="store_true", default=env_str("CF_RESET_STATE", "false").lower() == "true")
     p.add_argument("--clear-results", action="store_true", default=env_str("CF_CLEAR_RESULTS", "false").lower() == "true")
     r = p.parse_args()
@@ -634,6 +761,8 @@ def parse_args():
     a.verify_timeout = to_num(r.verify_timeout, 900, int, lo=30)
     a.min_v6_prefix = to_num(r.min_v6_prefix, 112, int, lo=1, hi=128)
     a.commit_every_min = to_num(r.commit_every_min, 10.0, float, lo=0)
+    a.wait_note = f"等待 {to_num(r.wait_min, 10, int, lo=0)} 分钟"
+    a.loop_forever = r.loop_forever
     a.reset_state, a.clear_results = r.reset_state, r.clear_results
     return a
 
@@ -649,8 +778,15 @@ def main() -> int:
     except Abort as e:
         log(f"::error::{e}")
         code = 1
+        if e.fatal:  # 配置类错误：继续接力只会反复失败，通知 workflow 停止
+            runner.stop_chain = True
+    except Exception:  # 未预期的程序错误：同样停止接力，避免无限循环
+        traceback.print_exc()
+        code = 1
+        runner.stop_chain = True
     finally:
         runner.write_summary()
+        runner.export_outputs()
     return code
 
 
